@@ -668,7 +668,7 @@ footer{border-top:1px solid var(--gb);padding:56px 40px 36px;max-width:1360px;ma
   .hero{padding:80px 18px 50px}
   .section{padding:60px 18px}
   .section-sm{padding:40px 18px}
-  .chat-wrap,.cloud-grid,.wf-wrap,.dash-wrap{padding-left:18px;padding-right:18px;padding-bottom:60px}
+  .chat-wrap,.cloud-grid,.wf-wrap{padding-left:18px;padding-right:18px;padding-bottom:60px}
   .dash{grid-template-columns:1fr;min-height:auto}
   .dash-side{display:none}
   .dash-main{padding:20px}
@@ -1127,6 +1127,14 @@ footer{border-top:1px solid var(--gb);padding:56px 40px 36px;max-width:1360px;ma
       <div class="wf-wrap" style="padding:0">
         <div class="wf-canvas">
           <div class="wf-nodes" id="wfNodes"></div>
+          <!-- ✅ FIX: these buttons were missing entirely -->
+          <div class="wf-controls">
+            <button class="btn btn-primary" onclick="runWorkflow()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 3l14 9-14 9V3z"/></svg>
+              Run workflow
+            </button>
+            <button class="btn btn-outline" onclick="resetWorkflow()">Reset</button>
+          </div>
         </div>
       </div>
     </div>
@@ -1272,27 +1280,38 @@ const state = {
   user: null,
   memory: 84,
   isRecording: false,
-  workflow: { running: false, step: -1 },
-  stats: { projects: 12, storage: 248, tokens: 1.8 }
+  workflow: { running: false, step: -1 }
 };
 
-/* ==================== SUPABASE AUTH ==================== */
-// Replace with your own project's URL and public anon key (Project Settings → API in Supabase).
+/* ==================== SUPABASE (SAFE INIT — never crashes the app) ==================== */
 const SUPABASE_URL = 'https://pvjrtuspjzvuuiqiongw.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_2UpJyYchDorxYjLAYMINNA_JUzL9RtO';
-const supabase = (SUPABASE_URL.includes('YOUR-PROJECT'))
-  ? null
-  : window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+let sb = null;
+try{
+  if (window.supabase && typeof window.supabase.createClient === 'function' && !SUPABASE_URL.includes('YOUR-PROJECT')){
+    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  } else {
+    console.warn('[NEXUS] Supabase SDK not available — accounts & chat history are disabled, everything else works.');
+  }
+}catch(err){
+  console.error('[NEXUS] Supabase init failed:', err);
+  sb = null;
+}
+const authEnabled = !!sb;
+
+/* ---------- Auth ---------- */
 let authMode = 'signin';
+
 function openAuth(mode){
-  if (!supabase){
-    toast('info', 'Supabase not configured', 'Add your Supabase URL and anon key in the script to enable accounts.');
+  if (!authEnabled){
+    toast('info', 'Accounts unavailable', 'The Supabase library did not load. The rest of the app still works.');
     return;
   }
   authMode = mode;
   updateAuthModalMode();
-  document.getElementById('authError').style.display = 'none';
+  const errEl = document.getElementById('authError');
+  errEl.style.display = 'none';
   document.getElementById('authOv').classList.add('open');
 }
 function closeAuth(){ document.getElementById('authOv').classList.remove('open'); }
@@ -1309,11 +1328,15 @@ async function submitAuth(){
   const password = document.getElementById('authPassword').value;
   const errEl = document.getElementById('authError');
   errEl.style.display = 'none';
+  if (!authEnabled){ errEl.textContent = 'Accounts are not configured.'; errEl.style.display = 'block'; return; }
   if (!email || !password){ errEl.textContent = 'Enter an email and password.'; errEl.style.display = 'block'; return; }
+
+  const btn = document.getElementById('authSubmitBtn');
+  btn.disabled = true;
   try{
     const { data, error } = authMode === 'signin'
-      ? await supabase.auth.signInWithPassword({ email, password })
-      : await supabase.auth.signUp({ email, password });
+      ? await sb.auth.signInWithPassword({ email, password })
+      : await sb.auth.signUp({ email, password });
     if (error) throw error;
     closeAuth();
     if (authMode === 'signup' && !data.session){
@@ -1324,11 +1347,16 @@ async function submitAuth(){
   }catch(err){
     errEl.textContent = err.message || 'Something went wrong.';
     errEl.style.display = 'block';
+  }finally{
+    btn.disabled = false;
   }
 }
 async function signOutUser(){
-  if (!supabase) return;
-  await supabase.auth.signOut();
+  if (!authEnabled) return;
+  await sb.auth.signOut();
+  state.thread = [];
+  renderThread();
+  renderDashboard();
   toast('info', 'Signed out', 'Come back anytime.');
 }
 function updateAuthUI(user){
@@ -1336,28 +1364,36 @@ function updateAuthUI(user){
   const area = document.getElementById('authArea');
   if (!area) return;
   if (user){
-    area.innerHTML = `<div class="user-pill"><span class="dot2"></span>${escapeHtml(user.email)}</div><button class="btn btn-ghost" onclick="signOutUser()">Sign out</button>`;
+    area.innerHTML = `<div class="user-pill"><span class="dot2"></span>${escapeHtml(user.email || 'user')}</div>
+      <button class="btn btn-ghost" onclick="signOutUser()">Sign out</button>`;
     loadChatHistory();
   } else {
     area.innerHTML = `<button class="btn btn-ghost" onclick="openAuth('signin')">Sign in</button>`;
   }
 }
 async function loadChatHistory(){
-  if (!supabase || !state.user) return;
-  const { data, error } = await supabase.from('chat_messages')
-    .select('role,text')
-    .eq('user_id', state.user.id)
-    .order('created_at', { ascending: true })
-    .limit(100);
-  if (!error && data && data.length){
-    state.thread = data.map(m => ({ role: m.role, text: m.text }));
-    renderThread();
-    renderDashboard();
+  if (!authEnabled || !state.user) return;
+  try{
+    const { data, error } = await sb.from('chat_messages')
+      .select('role,text,created_at')
+      .eq('user_id', state.user.id)
+      .order('created_at', { ascending: true })
+      .limit(100);
+    if (error) throw error;
+    if (data && data.length){
+      state.thread = data.map(m => ({ role: m.role, text: m.text }));
+      renderThread();
+      renderDashboard();
+    }
+  }catch(err){
+    console.warn('[NEXUS] Could not load chat history:', err.message);
   }
 }
-if (supabase){
-  supabase.auth.getSession().then(({ data }) => updateAuthUI(data.session?.user || null));
-  supabase.auth.onAuthStateChange((_event, session) => updateAuthUI(session?.user || null));
+if (authEnabled){
+  sb.auth.getSession()
+    .then(({ data }) => updateAuthUI(data && data.session ? data.session.user : null))
+    .catch(() => updateAuthUI(null));
+  sb.auth.onAuthStateChange((_event, session) => updateAuthUI(session ? session.user : null));
 }
 
 /* ==================== API KEY SETTINGS ==================== */
@@ -1375,6 +1411,13 @@ function saveKeys(){
   localStorage.setItem('nexus_key_gemini', document.getElementById('keyGemini').value.trim());
   closeKeys();
   toast('success', 'Keys saved', 'Stored locally in this browser.');
+}
+function getKeys(){
+  return {
+    openai: localStorage.getItem('nexus_key_openai') || '',
+    anthropic: localStorage.getItem('nexus_key_anthropic') || '',
+    gemini: localStorage.getItem('nexus_key_gemini') || ''
+  };
 }
 
 /* ==================== NAV / PAGES ==================== */
@@ -1405,9 +1448,23 @@ document.querySelectorAll('.theme-sw button').forEach(btn => {
     btn.classList.add('active');
     document.body.setAttribute('data-theme', btn.dataset.t);
     state.theme = btn.dataset.t;
-    toast('info', 'Theme changed', `Switched to ${btn.dataset.t} mode.`);
+    toast('info', 'Theme changed', 'Switched to ' + btn.dataset.t + ' mode.');
   });
 });
+
+/* ==================== HELPERS ==================== */
+function escapeHtml(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+function fmt(s){
+  let h = escapeHtml(s);
+  h = h.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
+  h = h.replace(/\n/g, '<br>');
+  return h;
+}
 
 /* ==================== TOASTS ==================== */
 function toast(type, title, desc, duration = 4000){
@@ -1420,7 +1477,7 @@ function toast(type, title, desc, duration = 4000){
   };
   el.innerHTML = `
     <div class="ti"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">${icons[type]||icons.info}</svg></div>
-    <div class="tt"><div class="t">${title}</div><div class="d">${desc}</div></div>
+    <div class="tt"><div class="t">${escapeHtml(title)}</div><div class="d">${escapeHtml(desc)}</div></div>
   `;
   document.getElementById('toasts').appendChild(el);
   setTimeout(() => {
@@ -1450,29 +1507,34 @@ function typeLoop(){
   } else {
     heroTyped.textContent = cur.slice(0, hcIdx - 1);
     hcIdx--;
-    if (hcIdx === 0){ hDeleting = false; hpIdx = (hpIdx+1) % heroPhrases.length; return setTimeout(typeLoop, 400); }
+    if (hcIdx === 0){ hDeleting = false; hpIdx = (hpIdx + 1) % heroPhrases.length; return setTimeout(typeLoop, 400); }
     return setTimeout(typeLoop, 14);
   }
 }
 typeLoop();
 
+/* ✅ FIX: hero chips now actually do something */
 function heroAction(action){
-  // These hero chips just point to the real, working part of the app instead of faking a result.
+  if (action === 'files'){ go('cloud'); toast('info', 'Cloud', 'Upload or search your files.'); return; }
+  if (action === 'agent'){ go('agents'); toast('info', 'Agents', 'Pick an agent to configure.'); return; }
+  if (action === 'workflow'){ go('agents'); setTimeout(runWorkflow, 500); return; }
+  if (action === 'analyze'){ go('chat'); return; }
   go('chat');
 }
 
+/* ✅ FIX: typing in the hero box now really sends a message */
 function focusHeroInput(){
   const input = document.getElementById('heroInput');
-  const prompt = document.getElementById('heroPrompt');
   input.style.display = 'block';
   input.focus();
   input.onkeydown = (e) => {
     if (e.key === 'Enter' && input.value.trim()){
       const val = input.value.trim();
-      heroTyped.textContent = val;
       input.value = '';
       input.style.display = 'none';
-      heroAction('analyze');
+      go('chat');
+      const ci = document.getElementById('chatInput');
+      if (ci){ ci.value = val; sendChat(); }
     }
   };
 }
@@ -1481,8 +1543,8 @@ function focusHeroInput(){
 const commands = [
   { group:'Suggested', icon:'file', title:'Find my latest presentation', desc:'Semantic search across cloud', action:() => { go('cloud'); toast('info','Searching','Looking for your latest presentation…'); } },
   { group:'Suggested', icon:'agent', title:'Create a new AI agent', desc:'Build a specialized autonomous assistant', action:() => { go('agents'); toast('success','Agent builder','Choose a template to get started.'); } },
-  { group:'Suggested', icon:'bolt', title:'View example workflow', desc:'See the Research → Analyst pipeline diagram', action:() => go('agents') },
-  { group:'Suggested', icon:'spark', title:"Ask AI a question", desc:'Jump into the multi-model chat', action:() => go('chat') },
+  { group:'Suggested', icon:'bolt', title:'Run the example workflow', desc:'Research → Analyst pipeline', action:() => { go('agents'); setTimeout(runWorkflow, 400); } },
+  { group:'Suggested', icon:'spark', title:'Ask AI a question', desc:'Jump into the multi-model chat', action:() => go('chat') },
   { group:'Suggested', icon:'compare', title:'Compare these documents', desc:'Diff two files with AI analysis', action:() => { toast('info','Compare mode','Select two files in Cloud to compare.'); go('cloud'); } },
   { group:'Navigate', icon:'home', title:'Home', desc:'Platform overview', action:() => go('home') },
   { group:'Navigate', icon:'tpl', title:'Templates', desc:'Browse the template library', action:() => go('templates') },
@@ -1493,7 +1555,8 @@ const commands = [
   { group:'Navigate', icon:'studio', title:'Studio', desc:'Generative workspace', action:() => go('studio') },
   { group:'Actions', icon:'theme', title:'Switch theme to Aurora', desc:'Cool cyan-green atmosphere', action:() => { document.querySelector('[data-t="aurora"]').click(); } },
   { group:'Actions', icon:'theme', title:'Switch theme to Midnight', desc:'Deep violet default', action:() => { document.querySelector('[data-t="midnight"]').click(); } },
-  { group:'Actions', icon:'theme', title:'Switch theme to Light', desc:'Bright minimal mode', action:() => { document.querySelector('[data-t="light"]').click(); } }
+  { group:'Actions', icon:'theme', title:'Switch theme to Light', desc:'Bright minimal mode', action:() => { document.querySelector('[data-t="light"]').click(); } },
+  { group:'Actions', icon:'agent', title:'Set API keys', desc:'Connect ChatGPT / Claude / Gemini', action:() => openKeys() }
 ];
 const iconMap = {
   file:'<path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/>',
@@ -1510,7 +1573,8 @@ const iconMap = {
   theme:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/>'
 };
 
-function renderCmd(filter = ''){
+function renderCmd(filter){
+  filter = filter || '';
   const list = document.getElementById('cmdList');
   const q = filter.toLowerCase().trim();
   let filtered = commands;
@@ -1520,15 +1584,15 @@ function renderCmd(filter = ''){
     return;
   }
   const groups = {};
-  filtered.forEach(c => { if(!groups[c.group]) groups[c.group] = []; groups[c.group].push(c); });
+  filtered.forEach(c => { if (!groups[c.group]) groups[c.group] = []; groups[c.group].push(c); });
   let html = '';
   let idx = 0;
   Object.keys(groups).forEach(g => {
     html += `<div class="cmd-gl">${g}</div>`;
     groups[g].forEach(c => {
-      html += `<div class="cmd-it${idx===0?' active':''}" data-idx="${idx}" data-title="${c.title}">
+      html += `<div class="cmd-it${idx===0?' active':''}" data-idx="${idx}" data-title="${escapeHtml(c.title)}">
         <div class="ci"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${iconMap[c.icon]||iconMap.file}</svg></div>
-        <div class="ct"><div class="t">${c.title}</div><div class="d">${c.desc}</div></div>
+        <div class="ct"><div class="t">${escapeHtml(c.title)}</div><div class="d">${escapeHtml(c.desc)}</div></div>
         <div class="ck">↵</div>
       </div>`;
       idx++;
@@ -1554,14 +1618,17 @@ function closeCmd(){
   document.getElementById('cmdInput').value = '';
 }
 document.addEventListener('keydown', e => {
-  if ((e.metaKey || e.ctrlKey) && e.key === 'k'){ e.preventDefault(); document.getElementById('cmdOv').classList.contains('open') ? closeCmd() : openCmd(); }
+  if ((e.metaKey || e.ctrlKey) && e.key === 'k'){
+    e.preventDefault();
+    document.getElementById('cmdOv').classList.contains('open') ? closeCmd() : openCmd();
+  }
   if (e.key === 'Escape' && document.getElementById('cmdOv').classList.contains('open')) closeCmd();
   if (document.getElementById('cmdOv').classList.contains('open')){
     const items = document.querySelectorAll('.cmd-it');
     let active = document.querySelector('.cmd-it.active');
-    if (e.key === 'ArrowDown'){ e.preventDefault(); if(!items.length)return; const i = active ? Array.from(items).indexOf(active) : -1; active?.classList.remove('active'); items[(i+1)%items.length].classList.add('active'); }
-    if (e.key === 'ArrowUp'){ e.preventDefault(); if(!items.length)return; const i = active ? Array.from(items).indexOf(active) : 0; active?.classList.remove('active'); items[(i-1+items.length)%items.length].classList.add('active'); }
-    if (e.key === 'Enter' && active){ active.click(); }
+    if (e.key === 'ArrowDown'){ e.preventDefault(); if (!items.length) return; const i = active ? Array.from(items).indexOf(active) : -1; if (active) active.classList.remove('active'); items[(i+1)%items.length].classList.add('active'); }
+    if (e.key === 'ArrowUp'){ e.preventDefault(); if (!items.length) return; const i = active ? Array.from(items).indexOf(active) : 0; if (active) active.classList.remove('active'); items[(i-1+items.length)%items.length].classList.add('active'); }
+    if (e.key === 'Enter' && active){ e.preventDefault(); active.click(); }
   }
 });
 
@@ -1602,11 +1669,13 @@ const tplIconMap = {
   video:'<rect x="2" y="6" width="14" height="12" rx="2"/><path d="M22 8l-6 4 6 4V8z"/>',
   file:'<path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/>'
 };
-function renderTemplates(filter = 'all'){
+function renderTemplates(filter){
+  filter = filter || 'all';
   const grid = document.getElementById('tplGrid');
+  if (!grid) return;
   const list = filter === 'all' ? templates : templates.filter(t => t.cat === filter);
   grid.innerHTML = list.map(t => `
-    <div class="tpl-card" onclick="launchTemplate('${t.name}','${t.cat}')">
+    <div class="tpl-card" onclick="launchTemplate('${t.name.replace(/'/g, "\\'")}','${t.cat}')">
       <div class="tpl-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">${tplIconMap[t.icon]||tplIconMap.file}</svg></div>
       <h3>${t.name}</h3>
       <p>${t.desc}</p>
@@ -1615,11 +1684,11 @@ function renderTemplates(filter = 'all'){
   `).join('');
 }
 function launchTemplate(name, cat){
+  const tpl = templates.find(t => t.name === name);
   toast('processing', 'Launching template', name + ' is being prepared…');
   setTimeout(() => {
-    if (cat === 'agent') go('agents');
-    else if (cat === 'workflow') go('agents');
-    else if (cat === 'studio') { go('studio'); document.getElementById('studioPrompt').value = name + ' — ' + templates.find(t => t.name === name).desc; }
+    if (cat === 'agent' || cat === 'workflow') go('agents');
+    else if (cat === 'studio'){ go('studio'); document.getElementById('studioPrompt').value = name + ' — ' + (tpl ? tpl.desc : ''); }
     else if (cat === 'document') go('cloud');
     else if (cat === 'analytics') go('dashboard');
     toast('success', 'Template ready', name + ' has been loaded into your workspace.');
@@ -1637,26 +1706,27 @@ document.querySelectorAll('.tpl-filter').forEach(f => {
 function updateGreeting(){
   const h = new Date().getHours();
   const greet = h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
-  document.getElementById('greeting').textContent = greet + ', Alex.';
+  const g = document.getElementById('greeting');
+  if (g) g.textContent = greet + ', Alex.';
 }
 function renderDashboard(){
   const act = document.getElementById('activityList');
   if (act){
     if (!state.thread.length){
-      act.innerHTML = `<div class="txt" style="padding:10px 0"><div class="s">No messages yet — <a onclick="go('chat')" style="color:var(--violet2);cursor:pointer">start a chat</a> to see it here.</div></div>`;
+      act.innerHTML = '<div style="padding:10px 0;font-family:var(--fm);font-size:10.5px;color:var(--t3)">No messages yet — <a onclick="go(\'chat\')" style="color:var(--violet2);cursor:pointer">start a chat</a> to see it here.</div>';
     } else {
       act.innerHTML = state.thread.slice(-5).reverse().map(m => `
         <div class="ai-activity">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${tplIconMap.chat}</svg></div>
-          <div class="txt"><div class="t">${m.role === 'ai' ? 'AI reply' : 'You'}</div><div class="s">${m.text.slice(0,80)}${m.text.length>80?'…':''}</div></div>
+          <div class="txt"><div class="t">${m.role === 'ai' ? 'AI reply' : 'You'}</div><div class="s">${escapeHtml(m.text.slice(0,80))}${m.text.length>80?'…':''}</div></div>
         </div>
       `).join('');
     }
   }
   const fl = document.getElementById('filesList');
-  if (fl) fl.innerHTML = `<div class="txt" style="padding:10px 0"><div class="s">Upload files from the <a onclick="go('cloud')" style="color:var(--violet2);cursor:pointer">Cloud</a> page to see them here.</div></div>`;
+  if (fl) fl.innerHTML = '<div style="padding:10px 0;font-family:var(--fm);font-size:10.5px;color:var(--t3)">Upload files from the <a onclick="go(\'cloud\')" style="color:var(--violet2);cursor:pointer">Cloud</a> page to see them here.</div>';
 }
-function dashNav(el, key){
+function dashNav(el){
   document.querySelectorAll('.dash-nav').forEach(n => n.classList.remove('active'));
   el.classList.add('active');
 }
@@ -1680,33 +1750,31 @@ function selectModel(id){
   state.activeModel = id;
   renderModels();
   const m = models.find(x => x.id === id);
-  toast('info', 'Engine switched', 'Now using ' + m.name + ' engine for this conversation.');
+  toast('info', 'Engine switched', 'Now using ' + m.name + ' for this conversation.');
 }
 function renderThread(){
   const el = document.getElementById('chatThread');
   if (!el) return;
   if (!state.thread.length){
-    el.innerHTML = `<div class="msg ai"><div class="av">AI</div><div class="bub">Pick an engine on the left, add its API key (gear icon), and say hello.</div></div>`;
+    el.innerHTML = '<div class="msg ai"><div class="av">AI</div><div class="bub">Pick an engine on the left, add its API key (gear icon ⚙), and say hello. Without a key you will get local demo replies.</div></div>';
     return;
   }
   el.innerHTML = state.thread.map(m => `
     <div class="msg ${m.role}">
-      <div class="av">${m.role==='ai'?'AI':'A'}</div>
-      <div class="bub">${m.text}</div>
+      <div class="av">${m.role === 'ai' ? 'AI' : 'A'}</div>
+      <div class="bub">${fmt(m.text)}</div>
     </div>
   `).join('');
   el.scrollTop = el.scrollHeight;
 }
-function msgAction(a){
-  toast('info', a, 'Action triggered on the AI response.');
+
+/* ✅ FIX: local demo reply so the chat visibly works even without a key */
+function demoReply(model, prompt){
+  return 'Demo mode — no API key set for ' + model.name + '.\n\nYou said: "' + prompt + '"\n\n' +
+    'Open the gear icon (\u2699) next to "AI Engine" and paste a real ' + model.name +
+    ' API key to get live answers. Until then this is a local placeholder reply.';
 }
-function getKeys(){
-  return {
-    openai: localStorage.getItem('nexus_key_openai') || '',
-    anthropic: localStorage.getItem('nexus_key_anthropic') || '',
-    gemini: localStorage.getItem('nexus_key_gemini') || ''
-  };
-}
+
 async function callAI(model, history){
   const keys = getKeys();
   const key = keys[model.provider];
@@ -1722,7 +1790,7 @@ async function callAI(model, history){
       })
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error?.message || 'OpenAI request failed');
+    if (!res.ok) throw new Error((data.error && data.error.message) || 'OpenAI request failed');
     return data.choices[0].message.content;
   }
 
@@ -1742,12 +1810,12 @@ async function callAI(model, history){
       })
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error?.message || 'Claude request failed');
+    if (!res.ok) throw new Error((data.error && data.error.message) || 'Claude request failed');
     return data.content[0].text;
   }
 
   if (model.provider === 'gemini'){
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model.apiModel}:generateContent?key=${key}`, {
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model.apiModel + ':generateContent?key=' + encodeURIComponent(key), {
       method:'POST',
       headers:{ 'Content-Type':'application/json' },
       body: JSON.stringify({
@@ -1755,15 +1823,16 @@ async function callAI(model, history){
       })
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error?.message || 'Gemini request failed');
+    if (!res.ok) throw new Error((data.error && data.error.message) || 'Gemini request failed');
     return data.candidates[0].content.parts[0].text;
   }
+  throw new Error('Unknown provider');
 }
 async function saveMessage(role, text, modelId){
-  if (!state.user) return;
+  if (!authEnabled || !state.user) return;
   try{
-    await supabase.from('chat_messages').insert({ user_id: state.user.id, role, text, model: modelId });
-  }catch(e){ /* history save is best-effort */ }
+    await sb.from('chat_messages').insert({ user_id: state.user.id, role: role, text: text, model: modelId });
+  }catch(e){ /* best-effort */ }
 }
 async function sendChat(){
   const input = document.getElementById('chatInput');
@@ -1772,33 +1841,32 @@ async function sendChat(){
   const model = models.find(m => m.id === state.activeModel);
   input.value = '';
 
-  state.thread.push({ role:'user', text: escapeHtml(text) });
+  state.thread.push({ role:'user', text: text });
   renderThread();
   saveMessage('user', text, model.id);
 
   const thread = document.getElementById('chatThread');
   const thinking = document.createElement('div');
   thinking.className = 'msg ai';
-  thinking.innerHTML = `<div class="av">AI</div><div class="bub"><div class="msg-stream"><span class="bars"><span></span><span></span><span></span><span></span></span>${model.name} is thinking…</div></div>`;
+  thinking.innerHTML = '<div class="av">AI</div><div class="bub"><div class="msg-stream"><span class="bars"><span></span><span></span><span></span><span></span></span>' + model.name + ' is thinking…</div></div>';
   thread.appendChild(thinking);
   thread.scrollTop = thread.scrollHeight;
 
   try{
-    const reply = await callAI(model, state.thread.map(m => ({ role: m.role, text: m.text })));
-    state.thread.push({ role:'ai', text: escapeHtml(reply) });
+    const reply = await callAI(model, state.thread.slice());
+    state.thread.push({ role:'ai', text: reply });
     saveMessage('ai', reply, model.id);
   }catch(err){
     if (err.message === 'NO_KEY'){
-      state.thread.push({ role:'ai', text: `No API key set for ${model.name} yet. Click the gear icon above the engine list to add one.` });
-      openKeys();
+      state.thread.push({ role:'ai', text: demoReply(model, text) });
+      toast('info', 'No API key', 'Using a local demo reply. Add a key via the gear icon for real answers.');
     } else {
-      state.thread.push({ role:'ai', text: `${model.name} error: ${escapeHtml(err.message)}` });
+      state.thread.push({ role:'ai', text: model.name + ' error: ' + err.message });
     }
   }
   renderThread();
   renderDashboard();
 }
-function escapeHtml(s){ return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function toggleMic(){
   const btn = document.getElementById('micBtn');
   state.isRecording = !state.isRecording;
@@ -1827,9 +1895,23 @@ const cloudData = [
 function runSearch(q){
   const el = document.getElementById('searchResults');
   if (!el) return;
-  if (!q.trim()){ el.innerHTML = ''; return; }
-  const lower = q.toLowerCase();
-  const results = cloudData.filter(d => d.name.toLowerCase().includes(lower) || d.desc.toLowerCase().includes(lower) || lower.split(' ').some(w => w.length>3 && (d.name.toLowerCase().includes(w) || d.desc.toLowerCase().includes(w))));
+  const query = (q || '').trim().toLowerCase();
+  if (!query){
+    // ✅ show suggested results instead of an empty panel
+    el.innerHTML = cloudData.slice(0,3).map(r => `
+      <div class="result">
+        <div class="rh"><span class="rt">${r.name}</span><span class="rm">SUGGESTED</span></div>
+        <div class="rd">${r.desc}</div>
+        <div class="why">${r.why}</div>
+      </div>
+    `).join('');
+    return;
+  }
+  const words = query.split(' ').filter(w => w.length > 3);
+  let results = cloudData.filter(d =>
+    d.name.toLowerCase().includes(query) || d.desc.toLowerCase().includes(query) ||
+    words.some(w => d.name.toLowerCase().includes(w) || d.desc.toLowerCase().includes(w))
+  );
   const final = results.length ? results : cloudData.slice(0,3);
   el.innerHTML = final.map(r => `
     <div class="result">
@@ -1847,11 +1929,12 @@ function fileAction(action){
 }
 function handleFiles(files){
   const list = document.getElementById('uploadList');
+  if (!list || !files) return;
   Array.from(files).forEach(f => {
     const ext = f.name.split('.').pop().toUpperCase().slice(0,4);
     const item = document.createElement('div');
     item.className = 'up-item';
-    item.innerHTML = `<div class="ic2">${ext}</div><div class="nm">${f.name}</div><div class="pr">Processing…</div>`;
+    item.innerHTML = '<div class="ic2">' + escapeHtml(ext) + '</div><div class="nm">' + escapeHtml(f.name) + '</div><div class="pr">Processing…</div>';
     list.appendChild(item);
     let pct = 0;
     const int = setInterval(() => {
@@ -1889,7 +1972,7 @@ const agents = [
 function renderAgents(){
   const grid = document.getElementById('agentsGrid');
   if (!grid) return;
-  grid.innerHTML = agents.map((a,i) => `
+  grid.innerHTML = agents.map(a => `
     <div class="agent-card" onclick="agentClick('${a.name}')">
       <div class="ah">
         <div class="aav" style="${a.color==='cyan'?'background:radial-gradient(circle at 30% 30%,var(--cyan2),var(--cyan));box-shadow:0 0 24px -6px var(--cyan)':''}">${a.name.split(' ').map(w=>w[0]).join('').slice(0,2)}</div>
@@ -1921,7 +2004,7 @@ function renderWorkflow(){
   el.innerHTML = workflowSteps.map((s, i) => {
     let cls = 'pending';
     if (state.workflow.running && i <= state.workflow.step) cls = i === state.workflow.step ? 'running' : 'done';
-    if (state.workflow.step >= workflowSteps.length - 1 && !state.workflow.running) cls = 'done';
+    else if (!state.workflow.running && state.workflow.step >= workflowSteps.length - 1) cls = 'done';
     const arrow = i < workflowSteps.length - 1 ? `<div class="wf-arrow${state.workflow.step > i ? ' lit' : ''}"></div>` : '';
     return `<div class="wf-node ${cls}">
       <div class="wt">${s.type}</div>
@@ -1929,6 +2012,7 @@ function renderWorkflow(){
     </div>${arrow}`;
   }).join('');
 }
+/* ✅ FIX: workflow can now actually be run from the buttons */
 function runWorkflow(){
   if (state.workflow.running) return;
   state.workflow = { running: true, step: 0 };
@@ -1941,9 +2025,9 @@ function runWorkflow(){
       setTimeout(advance, 900);
     } else {
       state.workflow.running = false;
+      state.workflow.step = workflowSteps.length - 1;
       renderWorkflow();
       toast('success', 'Workflow complete', '6 steps executed · 1 notification sent.');
-      go('agents');
     }
   };
   setTimeout(advance, 900);
@@ -1956,14 +2040,14 @@ function resetWorkflow(){
 
 /* ==================== STUDIO ==================== */
 const studioModes = {
-  presentation: { label:'Presentations', slides:['The New Intelligence Layer','One Workspace. Every Capability.','Intelligence That Adapts','Built for Modern Teams','The Ambient AI Advantage','Your Intelligence. Everywhere.'] },
-  image: { label:'Images', slides:['Cinematic product shot','Ambient studio lighting','Neural atmosphere background','Abstract AI core visual'] },
-  video: { label:'Videos', slides:['Opening title sequence','Product walkthrough','Team montage','Closing brand moment'] },
-  audio: { label:'Audio', slides:['Voiceover intro','Ambient soundscape','Transition sting','Outro'] },
-  music: { label:'Music', slides:['Main theme','Ambient bed','Percussive riser','Outro resolve'] },
-  document: { label:'Documents', slides:['Executive Summary','Market Context','Key Findings','Recommendations'] },
-  website: { label:'Websites', slides:['Hero section','Features grid','Pricing section','CTA + footer'] },
-  code: { label:'Code', slides:['Project scaffold','API layer','UI components','Tests + build'] }
+  presentation: { label:'Presentations' },
+  image: { label:'Images' },
+  video: { label:'Videos' },
+  audio: { label:'Audio' },
+  music: { label:'Music' },
+  document: { label:'Documents' },
+  website: { label:'Websites' },
+  code: { label:'Code' }
 };
 const textModes = ['presentation','document','website','code'];
 document.querySelectorAll('.studio-tabs button').forEach(btn => {
@@ -1973,26 +2057,28 @@ document.querySelectorAll('.studio-tabs button').forEach(btn => {
   });
 });
 async function generateContent(){
-  const prompt = document.getElementById('studioPrompt').value.trim();
-  const mode = document.querySelector('.studio-tabs button.active').dataset.mode;
+  const promptEl = document.getElementById('studioPrompt');
+  const prompt = promptEl.value.trim();
+  const activeTab = document.querySelector('.studio-tabs button.active');
+  const mode = activeTab ? activeTab.dataset.mode : 'presentation';
   const preview = document.getElementById('genPreview');
   if (!prompt){ toast('info', 'Add a prompt', 'Describe what you want first.'); return; }
 
   if (!textModes.includes(mode)){
-    preview.innerHTML = `<div class="gen-empty"><div class="t">Not connected yet</div><div class="s">${studioModes[mode].label} generation needs an image/video/audio API, which isn't wired up here. Text modes (Presentations, Documents, Websites, Code) use your chat engine's API key.</div></div>`;
+    preview.innerHTML = '<div class="gen-empty"><div class="t">Not connected yet</div><div class="s">' + studioModes[mode].label + ' generation needs an image/video/audio API, which isn\'t wired up here. Text modes (Presentations, Documents, Websites, Code) use your chat engine\'s API key.</div></div>';
     return;
   }
 
   const model = models.find(m => m.id === state.activeModel);
   preview.innerHTML = '<div class="gen-empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 12a9 9 0 11-6.22-8.56"/></svg><div class="t">Generating…</div><div class="s">Asking ' + model.name + '…</div></div>';
   try{
-    const reply = await callAI(model, [{ role:'user', text: `Create ${studioModes[mode].label.toLowerCase()} content for this brief: ${prompt}` }]);
-    preview.innerHTML = `<div class="gen-slide" style="white-space:pre-wrap">${escapeHtml(reply)}</div>`;
+    const reply = await callAI(model, [{ role:'user', text: 'Create ' + studioModes[mode].label.toLowerCase() + ' content for this brief: ' + prompt }]);
+    preview.innerHTML = '<div class="gen-slide" style="white-space:pre-wrap">' + fmt(reply) + '</div>';
   }catch(err){
     if (err.message === 'NO_KEY'){
-      preview.innerHTML = `<div class="gen-empty"><div class="t">No API key</div><div class="s">Add a key for ${model.name} in the AI Chat page (gear icon) to generate real content.</div></div>`;
+      preview.innerHTML = '<div class="gen-empty"><div class="t">No API key</div><div class="s">Add a key for ' + model.name + ' in the AI Chat page (gear icon) to generate real content.</div></div>';
     } else {
-      preview.innerHTML = `<div class="gen-empty"><div class="t">Generation failed</div><div class="s">${escapeHtml(err.message)}</div></div>`;
+      preview.innerHTML = '<div class="gen-empty"><div class="t">Generation failed</div><div class="s">' + escapeHtml(err.message) + '</div></div>';
     }
   }
 }
@@ -2001,15 +2087,17 @@ async function generateContent(){
 document.querySelectorAll('.slider').forEach(slider => {
   const fill = slider.querySelector('.fill');
   const knob = slider.querySelector('.knob');
-  const label = document.getElementById('v' + slider.dataset.slider.charAt(0).toUpperCase() + slider.dataset.slider.slice(1));
+  const key = slider.dataset.slider;
+  const label = document.getElementById('v' + key.charAt(0).toUpperCase() + key.slice(1));
   let dragging = false;
   function update(e){
     const rect = slider.getBoundingClientRect();
-    const x = (e.clientX || e.touches?.[0]?.clientX || 0) - rect.left;
-    let pct = Math.max(0, Math.min(100, (x / rect.width) * 100));
+    const clientX = (e.touches && e.touches[0]) ? e.touches[0].clientX : e.clientX;
+    const x = clientX - rect.left;
+    const pct = Math.max(0, Math.min(100, (x / rect.width) * 100));
     fill.style.width = pct + '%';
     knob.style.left = pct + '%';
-    if (slider.dataset.slider === 'length'){
+    if (key === 'length'){
       if (label) label.textContent = Math.max(1, Math.round(pct / 100 * 12));
     } else {
       if (label) label.textContent = (pct / 100).toFixed(2);
@@ -2018,8 +2106,8 @@ document.querySelectorAll('.slider').forEach(slider => {
   slider.addEventListener('mousedown', e => { dragging = true; update(e); });
   document.addEventListener('mousemove', e => { if (dragging) update(e); });
   document.addEventListener('mouseup', () => dragging = false);
-  slider.addEventListener('touchstart', e => { dragging = true; update(e); });
-  document.addEventListener('touchmove', e => { if (dragging) update(e); });
+  slider.addEventListener('touchstart', e => { dragging = true; update(e); }, {passive:true});
+  document.addEventListener('touchmove', e => { if (dragging) update(e); }, {passive:true});
   document.addEventListener('touchend', () => dragging = false);
   slider.addEventListener('click', update);
 });
@@ -2034,14 +2122,9 @@ function boot(){
   renderAgents();
   renderWorkflow();
   runSearch('');
-  // Welcome toast
   setTimeout(() => toast('info', 'Welcome to NEXUS', 'Press ⌘K to open the command palette anytime.'), 900);
 }
 boot();
-
-// Re-render when page changes (for correct scroll/paint)
-const origGo = go;
-go = function(page){ origGo(page); };
 </script>
 </body>
 </html>
